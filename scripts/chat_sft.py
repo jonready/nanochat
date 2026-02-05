@@ -38,6 +38,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
+parser.add_argument("--gradient-checkpointing", action="store_true", help="trade compute for memory (useful for large models on small GPUs)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
@@ -80,6 +81,10 @@ model, tokenizer, meta = load_model("base", device, phase="train", model_tag=arg
 pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?")
+# Enable gradient checkpointing if requested (trades compute for memory)
+if args.gradient_checkpointing:
+    model.config.gradient_checkpointing = True
+    print0("Gradient checkpointing enabled")
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer

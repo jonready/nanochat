@@ -39,7 +39,13 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, keep_last_n=3):
+    """
+    Save a checkpoint and optionally clean up old checkpoints.
+
+    Args:
+        keep_last_n: Number of checkpoints to keep. Set to 0 or None to keep all.
+    """
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -51,12 +57,51 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
+        # Clean up old checkpoints if keep_last_n is set
+        if keep_last_n and keep_last_n > 0:
+            _cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+        # Clean up old optimizer checkpoints if keep_last_n is set
+        if keep_last_n and keep_last_n > 0:
+            _cleanup_old_optimizer_checkpoints(checkpoint_dir, keep_last_n, rank)
+
+
+def _cleanup_old_checkpoints(checkpoint_dir, keep_last_n):
+    """Remove old model and meta checkpoints, keeping only the last N."""
+    # Find all model checkpoints and sort by step number
+    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+    if len(model_files) <= keep_last_n:
+        return
+
+    # Get steps to delete (all except the last N)
+    files_to_delete = model_files[:-keep_last_n]
+    for model_path in files_to_delete:
+        step_str = os.path.basename(model_path).split("_")[-1].split(".")[0]
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step_str}.json")
+        # Remove model file
+        os.remove(model_path)
+        logger.info(f"Removed old checkpoint: {model_path}")
+        # Remove meta file if it exists
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
+
+
+def _cleanup_old_optimizer_checkpoints(checkpoint_dir, keep_last_n, rank):
+    """Remove old optimizer checkpoints for a specific rank, keeping only the last N."""
+    optim_files = sorted(glob.glob(os.path.join(checkpoint_dir, f"optim_*_rank{rank}.pt")))
+    if len(optim_files) <= keep_last_n:
+        return
+
+    files_to_delete = optim_files[:-keep_last_n]
+    for optim_path in files_to_delete:
+        os.remove(optim_path)
+        logger.info(f"Removed old optimizer checkpoint: {optim_path}")
+
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state

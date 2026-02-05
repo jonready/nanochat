@@ -1,7 +1,51 @@
-# nanochat
+# nanochat (3090 fork)
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
+
+> Training useful AI models on hardware you actually own.
+
+This is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) focused on making it practical to finetune and customize nanochat models on consumer GPUs. The upstream repo is designed for 8xH100 nodes ($24/hr), but most people don't have access to that kind of hardware. With a few key optimizations, it turns out you can do SFT, continued pretraining, and RL on a single RTX 3090 (24GB) while staying remarkably close to the stock training setup.
+
+The main model of interest right now is **d34** (2.2B parameters), Andrej's largest pretrained base model ([available on HuggingFace](https://huggingface.co/karpathy/nanochat-d34)). It achieves a CORE score of 0.3382, beating GPT-2 (0.257), and is small enough that with `model.bfloat16()`, gradient checkpointing, and MuonAdamW, you can run the full Muon + torch.compile training pipeline on a 24GB card at ~3,200 tok/sec.
+
+### What's different from upstream
+
+| | Upstream (8xH100) | This fork (1x 3090) |
+|---|---|---|
+| Optimizer | MuonAdamW | MuonAdamW (same) |
+| Master weights | fp32 | bf16 |
+| torch.compile | Yes | Yes |
+| Gradient checkpointing | Off | On |
+| Batch size | 524K tokens | 524K tokens (via grad accum) |
+
+### New scripts
+
+- **`scripts/travel_pretrain.py`** - Continued pretraining on domain data from a SQLite database. Use this to give the base model deeper knowledge of a specific domain before SFT.
+- **`scripts/chat_sft_lowmem.py`** - SFT with near-stock optimizer config, matching upstream learning rates, data mixture, and eval.
+
+### Quick start (3090)
+
+```bash
+# Download d34 base model from HuggingFace (one-time)
+python -c "from huggingface_hub import snapshot_download; snapshot_download('karpathy/nanochat-d34', local_dir='$HOME/.cache/nanochat/base_checkpoints/d34')"
+
+# Continued pretraining on your data (optional)
+python -m scripts.travel_pretrain --db-path=/path/to/your/data.db
+
+# SFT
+python -m scripts.chat_sft_lowmem --source=base --model-tag=d34
+```
+
+### Upstream stock scripts with gradient checkpointing
+
+The upstream `chat_sft.py` and `chat_rl.py` also support `--gradient-checkpointing` for running on smaller GPUs.
+
+---
+
+*Everything below is the original nanochat README from upstream.*
+
+---
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$50,000 to train in 2019) for only $73 (3 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI.
 

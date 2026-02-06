@@ -7,13 +7,13 @@ Usage:
 This loads the d34 base model and continues pretraining on travel content
 to give it better travel domain knowledge before SFT.
 
-Near-stock nanochat setup: Muon + AdamW, bf16 weights, torch.compile,
-gradient checkpointing. Uses model.setup_optimizer() from upstream.
+Near-stock nanochat setup: Muon + 8-bit Adam, bf16 weights,
+gradient checkpointing. Optimized for 24GB GPUs (RTX 3090).
 """
 
 import argparse
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import sqlite3
 import random
@@ -22,10 +22,12 @@ import gc
 from contextlib import nullcontext
 
 import torch
+import bitsandbytes as bnb
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.checkpoint_manager import load_model, save_checkpoint, find_last_step, load_checkpoint
 from nanochat.common import get_base_dir, print0, autodetect_device_type
+from nanochat.optim import polar_express_coeffs
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -39,7 +41,7 @@ parser.add_argument("--title-column", type=str, default="title", help="column wi
 parser.add_argument("--model-tag", type=str, default="d34", help="which base model to continue from")
 parser.add_argument("--output-tag", type=str, default="d34-travel", help="tag for the output checkpoint")
 # Training
-parser.add_argument("--device-batch-size", type=int, default=16, help="batch size per step (16 fits on 24GB with bf16)")
+parser.add_argument("--device-batch-size", type=int, default=8, help="batch size per step (8 fits on 24GB with bf16 + optimizer)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="context length")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--num-epochs", type=int, default=1, help="passes over the data")
@@ -63,13 +65,12 @@ print0(f"Loading {args.model_tag} base model...")
 model, tokenizer, meta = load_model('base', device, phase='train', model_tag=args.model_tag)
 model.config.gradient_checkpointing = True
 model = model.bfloat16()  # bf16 master weights: saves ~4 GB (8.6 -> 4.4 GB)
-model = torch.compile(model, dynamic=False)
+print0("Gradient checkpointing enabled, bf16 master weights")
 
 gc.collect()
 torch.cuda.empty_cache()
 
-orig_model = model._orig_mod
-num_params = sum(p.numel() for p in orig_model.parameters())
+num_params = sum(p.numel() for p in model.parameters())
 print0(f"Model parameters: {num_params:,}")
 
 # Calculate gradient accumulation
@@ -160,17 +161,73 @@ class DomainDataset:
         return inputs, targets
 
 # -----------------------------------------------------------------------------
-# Setup optimizer using model.setup_optimizer() (uses MuonAdamW)
-# With bf16 model, optimizer states are also bf16, preserving memory savings.
+# Low-memory optimizer: per-parameter Muon + 8-bit Adam
+# MuonAdamW stacks all same-shape params (~1.2 GB temporary tensors) which OOMs on 24GB.
+
+class LowMemMuon(torch.optim.Optimizer):
+    """Per-parameter Muon using Polar Express (from upstream nanochat.optim)."""
+    def __init__(self, params, lr=0.02, momentum=0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                buf = state["momentum_buffer"]
+                g = p.grad
+                buf.lerp_(g, 1 - momentum)
+                g = g.lerp(buf, momentum)
+                X = g.unsqueeze(0).bfloat16()
+                X = X / (X.norm() * 1.02 + 1e-6)
+                if X.size(-2) > X.size(-1):
+                    for a, b, c in polar_express_coeffs[:5]:
+                        A = X.mT @ X
+                        B = b * A + c * (A @ A)
+                        X = a * X + X @ B
+                else:
+                    for a, b, c in polar_express_coeffs[:5]:
+                        A = X @ X.mT
+                        B = b * A + c * (A @ A)
+                        X = a * X + B @ X
+                g = X.squeeze(0)
+                scale = max(1.0, p.shape[-2] / p.shape[-1]) ** 0.5
+                p.sub_(g, alpha=lr * scale)
 
 def setup_optimizer(model, lr_frac):
-    """Setup optimizer with reduced learning rates for continued pretraining."""
-    optimizer = model.setup_optimizer()
-    # Scale all LRs down by lr_frac to avoid catastrophic forgetting
-    for group in optimizer.param_groups:
-        group["lr"] = group["lr"] * lr_frac
-        group["initial_lr"] = group["lr"]
-    return optimizer
+    """Setup per-parameter optimizer with reduced LRs for continued pretraining."""
+    orig = model._orig_mod if hasattr(model, '_orig_mod') else model
+    model_dim = orig.config.n_embd
+    dmodel_lr_scale = (model_dim / 768) ** -0.5
+
+    matrix_params = list(orig.transformer.h.parameters())
+    embedding_params = list(orig.transformer.wte.parameters())
+    lm_head_params = list(orig.lm_head.parameters())
+    scalar_params = [orig.resid_lambdas, orig.x0_lambdas]
+    value_embeds_params = list(orig.value_embeds.parameters())
+
+    adam8_groups = [
+        dict(params=lm_head_params, lr=0.004 * dmodel_lr_scale * lr_frac),
+        dict(params=embedding_params, lr=0.2 * dmodel_lr_scale * lr_frac),
+    ]
+    if value_embeds_params:
+        adam8_groups.append(dict(params=value_embeds_params, lr=0.2 * dmodel_lr_scale * lr_frac))
+    adam_optimizer = bnb.optim.Adam8bit(adam8_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+    muon_optimizer = LowMemMuon(matrix_params, lr=0.02 * lr_frac, momentum=0.95)
+    scalar_optimizer = torch.optim.Adam(scalar_params, lr=0.005 * lr_frac, betas=(0.8, 0.95))
+
+    optimizers = [adam_optimizer, muon_optimizer, scalar_optimizer]
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+    return optimizers
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -192,7 +249,7 @@ print0(f"Total training steps: {total_steps:,}")
 gc.collect()
 torch.cuda.empty_cache()
 print0(f"\nSetting up optimizer with {args.learning_rate_frac:.1%} of original LR...")
-optimizer = setup_optimizer(model, args.learning_rate_frac)
+optimizers = setup_optimizer(model, args.learning_rate_frac)
 
 if torch.cuda.is_available():
     mem = torch.cuda.memory_allocated() / 1e9
@@ -219,7 +276,7 @@ if args.resume:
         print0(f"Resuming from checkpoint at step {resume_step}...")
         model_data = torch.load(os.path.join(checkpoint_dir, f"model_{resume_step:06d}.pt"), map_location=device)
         model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-        orig_model.load_state_dict(model_data, strict=True)
+        model.load_state_dict(model_data, strict=True)
         del model_data
         gc.collect()
         step = resume_step
@@ -254,11 +311,11 @@ try:
 
         # Save checkpoint
         if step > 0 and step % args.save_every == 0:
-            model_config_kwargs = orig_model.config.__dict__
+            model_config_kwargs = model.config.__dict__
             save_checkpoint(
                 checkpoint_dir,
                 step,
-                orig_model.state_dict(),
+                model.state_dict(),
                 None,
                 {
                     "step": step,
@@ -283,11 +340,13 @@ try:
 
         # Update LR
         lrm = get_lr_multiplier(step)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
 
         # Optimizer step
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
         model.zero_grad(set_to_none=True)
 
         torch.cuda.synchronize()
@@ -308,11 +367,11 @@ except KeyboardInterrupt:
 
 # Final save
 print0(f"\nSaving final checkpoint...")
-model_config_kwargs = orig_model.config.__dict__
+model_config_kwargs = model.config.__dict__
 save_checkpoint(
     checkpoint_dir,
     step,
-    orig_model.state_dict(),
+    model.state_dict(),
     None,
     {
         "step": step,

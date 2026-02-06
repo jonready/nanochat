@@ -39,6 +39,7 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
     gradient_checkpointing: bool = False # trade compute for memory
+    use_value_embeds: bool = True # value embeddings (ResFormer-style); disable for old checkpoints
 
 
 def norm(x):
@@ -46,8 +47,10 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
+def has_ve(layer_idx, n_layer, use_value_embeds=True):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    if not use_value_embeds:
+        return False
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
@@ -73,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer, config.use_value_embeds) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -176,7 +179,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer, config.use_value_embeds)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -403,28 +406,64 @@ class GPT(nn.Module):
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             if self.config.gradient_checkpointing and self.training and kv_cache is None:
-                x = checkpoint(block, x, ve, cos_sin, self.window_sizes[i], kv_cache, use_reentrant=False)
+                # Wrap lambda scaling + ve lookup + block inside checkpoint so the
+                # intermediate x_scaled tensor is recomputed during backward instead
+                # of stored. Saves ~4.7 GB for 34 layers (one 143 MB tensor per layer).
+                def layer_fn(x, x0, idx, *, _i=i, _block=block, _self=self):
+                    x = _self.resid_lambdas[_i] * x + _self.x0_lambdas[_i] * x0
+                    ve = _self.value_embeds[str(_i)](idx) if str(_i) in _self.value_embeds else None
+                    return _block(x, ve, cos_sin, _self.window_sizes[_i], None)
+                x = checkpoint(layer_fn, x, x0, idx, use_reentrant=False)
             else:
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            # Chunked cross-entropy with gradient checkpointing on each chunk.
+            # Each chunk's logits are recomputed during backward instead of stored,
+            # reducing activation memory from O(B*T*V) to O(B*chunk*V) at any time.
+            chunk_size = 256
+            vocab_size = self.config.vocab_size
+            lm_head = self.lm_head
+
+            def chunk_loss_fn(x_chunk, targets_chunk):
+                logits = lm_head(x_chunk)
+                logits = logits[..., :vocab_size].float()
+                logits = softcap * torch.tanh(logits / softcap)
+                loss = F.cross_entropy(logits.view(-1, vocab_size),
+                                       targets_chunk.view(-1), ignore_index=-1, reduction='sum')
+                valid = (targets_chunk != -1).sum()
+                return loss, valid
+
+            total_loss = torch.zeros(1, device=x.device)
+            total_valid = 0
+            use_ckpt = self.config.gradient_checkpointing and self.training
+            for i in range(0, T, chunk_size):
+                x_chunk = x[:, i:i+chunk_size]
+                t_chunk = targets[:, i:i+chunk_size].contiguous()
+                if use_ckpt:
+                    chunk_loss, valid = checkpoint(chunk_loss_fn, x_chunk, t_chunk, use_reentrant=False)
+                else:
+                    chunk_loss, valid = chunk_loss_fn(x_chunk, t_chunk)
+                total_loss = total_loss + chunk_loss
+                total_valid += valid
+            if loss_reduction == 'mean':
+                loss = total_loss / total_valid.clamp(min=1)
+            else:
+                loss = total_loss
+            return loss.squeeze()
         else:
-            # inference: just return the logits directly
+            # inference: materialize full logits
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
 
     @torch.inference_mode()

@@ -26,17 +26,24 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Old models don't have value embeddings (ResFormer-style)
+    if "use_value_embeds" not in model_config_kwargs:
+        model_config_kwargs["use_value_embeds"] = False
+        log0(f"Patching missing use_value_embeds in model config to False")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     n_layer = model_config.n_layer
+    # Infer device/dtype from existing model data to match loaded checkpoint
+    ref = next(iter(model_data.values()))
+    device, dtype = ref.device, ref.dtype
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
+        model_data["resid_lambdas"] = torch.ones(n_layer, device=device, dtype=dtype)
         log0(f"Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        model_data["x0_lambdas"] = torch.zeros(n_layer, device=device, dtype=dtype)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, keep_last_n=3):
@@ -73,8 +80,10 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
 
 def _cleanup_old_checkpoints(checkpoint_dir, keep_last_n):
     """Remove old model and meta checkpoints, keeping only the last N."""
-    # Find all model checkpoints and sort by step number
-    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+    # Find all model checkpoints and sort by modification time (not step number,
+    # which can reset across runs and cause newly saved checkpoints to be deleted)
+    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")),
+                         key=os.path.getmtime)
     if len(model_files) <= keep_last_n:
         return
 

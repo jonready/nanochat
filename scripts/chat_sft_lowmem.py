@@ -8,21 +8,25 @@ Usage:
 
 import argparse
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import gc
 import time
 from contextlib import nullcontext
 
+import bitsandbytes as bnb
+
 from nanochat.common import get_base_dir, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model, save_checkpoint, find_last_step
 from nanochat.engine import Engine
+from nanochat.optim import polar_express_coeffs
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
+from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
@@ -35,20 +39,20 @@ parser.add_argument("--source", type=str, default="base", help="base|sft - which
 parser.add_argument("--model-tag", type=str, default="d34-travel", help="model tag to load")
 parser.add_argument("--model-step", type=int, default=None, help="step to load from (None = latest)")
 # Training
-parser.add_argument("--device-batch-size", type=int, default=4, help="fits on 24GB with bf16 + grad checkpointing")
+parser.add_argument("--device-batch-size", type=int, default=8, help="fits on 24GB with bf16 + grad checkpointing (19.8 GB peak)")
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs")
 parser.add_argument("--target-examples-per-step", type=int, default=32, help="grad accum to reach this")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="stock unembedding LR")
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="stock embedding LR")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="stock matrix LR")
-parser.add_argument("--init-lr-frac", type=float, default=0.02, help="initial LR fraction (stock default)")
+parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR fraction (1.0 = stock default)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay")
 # Eval
-parser.add_argument("--eval-every", type=int, default=100, help="evaluate val loss every N steps")
+parser.add_argument("--eval-every", type=int, default=2000, help="evaluate val loss every N steps")
 parser.add_argument("--eval-steps", type=int, default=100, help="number of eval batches")
-parser.add_argument("--eval-metrics-every", type=int, default=200, help="evaluate accuracy metrics every N steps")
+parser.add_argument("--eval-metrics-every", type=int, default=5000, help="evaluate accuracy metrics every N steps")
 parser.add_argument("--eval-metrics-max-problems", type=int, default=1024, help="max problems for metrics eval")
-parser.add_argument("--save-every", type=int, default=200, help="save checkpoint every N steps")
+parser.add_argument("--save-every", type=int, default=1000, help="save checkpoint every N steps")
 parser.add_argument("--keep-last-n", type=int, default=3, help="checkpoints to keep (0 = keep all)")
 parser.add_argument("--resume", action="store_true", help="resume from latest checkpoint")
 args = parser.parse_args()
@@ -101,17 +105,19 @@ num_params = sum(p.numel() for p in model.parameters())
 print0(f"Model parameters: {num_params:,}")
 
 # -----------------------------------------------------------------------------
-# Task data mixture - match stock chat_sft.py
+# Task data mixture - scaled stock proportions for single-GPU 12h budget (~170K examples)
+# Stock (8xH100) uses 858K. At ~3000 tok/s on 3090, 12h ≈ 5400 steps × 32 ex/step = 170K.
 identity_conversations_filepath = os.path.join(get_base_dir(), "identity_conversations.jsonl")
 train_ds = TaskMixture([
-    ARC(subset="ARC-Easy", split="train"),       # 2.3K rows
-    ARC(subset="ARC-Challenge", split="train"),   # 1.1K rows
-    GSM8K(subset="main", split="train"),          # 8K rows
-    SmolTalk(split="train", stop=10_000),         # 10K rows (match stock)
-    CustomJSON(filepath=identity_conversations_filepath),  # 1K rows
-    SimpleSpelling(size=300, split="train"),       # 300 rows (match stock)
-    SpellingBee(size=300, split="train"),          # 300 rows (match stock)
-])
+    SmolTalk(split="train", stop=100_000),            # 100K rows general conversations
+    MMLU(subset="auxiliary_train", split="train", stop=30_000),  # 30K rows MC problems
+    GSM8K(subset="main", split="train"),              # 8K rows math + tool use
+    GSM8K(subset="main", split="train"),              # 2 epochs of GSM8K (match stock)
+    CustomJSON(filepath=identity_conversations_filepath),  # 1K rows identity
+    CustomJSON(filepath=identity_conversations_filepath),  # 2 epochs (match stock)
+    SimpleSpelling(size=15_000, split="train"),        # 15K rows
+    SpellingBee(size=7_000, split="train"),            # 7K rows
+]) # total: 100K + 30K + 16K + 2K + 15K + 7K = ~170K rows
 val_ds = SmolTalk(split="test")
 print0(f"Training examples: {len(train_ds):,}")
 
@@ -161,27 +167,86 @@ build_val_loader = lambda: sft_data_generator(val_ds, batch_size=args.device_bat
 print0(f"Number of iterations: {num_iterations:,}")
 
 # -----------------------------------------------------------------------------
-# Setup optimizer using model.setup_optimizer() (uses MuonAdamW)
-# With bf16 model, optimizer states are also bf16, preserving memory savings.
+# Low-memory optimizer: per-parameter Muon + 8-bit Adam
+# MuonAdamW stacks all same-shape params (~1.2 GB temporary tensors) which OOMs on 24GB.
+# Instead, we process each parameter individually and use 8-bit Adam for embed/lm_head.
+
+class LowMemMuon(torch.optim.Optimizer):
+    """Per-parameter Muon using Polar Express (from upstream nanochat.optim).
+    Unlike MuonAdamW, this processes parameters individually to minimize peak memory."""
+    def __init__(self, params, lr=0.02, momentum=0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                buf = state["momentum_buffer"]
+                g = p.grad
+                # Nesterov momentum
+                buf.lerp_(g, 1 - momentum)
+                g = g.lerp(buf, momentum)
+                # Polar Express orthogonalization
+                X = g.unsqueeze(0).bfloat16()
+                X = X / (X.norm() * 1.02 + 1e-6)
+                if X.size(-2) > X.size(-1):
+                    for a, b, c in polar_express_coeffs[:5]:
+                        A = X.mT @ X
+                        B = b * A + c * (A @ A)
+                        X = a * X + X @ B
+                else:
+                    for a, b, c in polar_express_coeffs[:5]:
+                        A = X @ X.mT
+                        B = b * A + c * (A @ A)
+                        X = a * X + B @ X
+                g = X.squeeze(0)
+                # Scale by aspect ratio (matches upstream)
+                scale = max(1.0, p.shape[-2] / p.shape[-1]) ** 0.5
+                p.sub_(g, alpha=lr * scale)
 
 gc.collect()
 torch.cuda.empty_cache()
 
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
-    weight_decay=args.weight_decay,
-)
+model_dim = model.config.n_embd
+dmodel_lr_scale = (model_dim / 768) ** -0.5
 
-# Apply init_lr_frac (stock: start at 2% of base LR)
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
+matrix_params = list(model.transformer.h.parameters())
+embedding_params = list(model.transformer.wte.parameters())
+lm_head_params = list(model.lm_head.parameters())
+scalar_params = [model.resid_lambdas, model.x0_lambdas]
+value_embeds_params = list(model.value_embeds.parameters())
+
+adam8_groups = [
+    dict(params=lm_head_params, lr=args.unembedding_lr * dmodel_lr_scale),
+    dict(params=embedding_params, lr=args.embedding_lr * dmodel_lr_scale),
+]
+if value_embeds_params:
+    adam8_groups.append(dict(params=value_embeds_params, lr=args.embedding_lr * dmodel_lr_scale))
+adam_optimizer = bnb.optim.Adam8bit(adam8_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=args.weight_decay)
+muon_optimizer = LowMemMuon(matrix_params, lr=args.matrix_lr, momentum=0.95)
+# Regular Adam for per-layer scalars (tiny params, 8-bit not needed)
+scalar_optimizer = torch.optim.Adam(scalar_params, lr=0.005, betas=(0.8, 0.95))
+
+optimizers = [adam_optimizer, muon_optimizer, scalar_optimizer]
+
+# Apply init_lr_frac
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["lr"] = group["lr"] * args.init_lr_frac
+        group["initial_lr"] = group["lr"]
 
 print0(f"Initial LRs (at init_lr_frac={args.init_lr_frac}):")
-for group in optimizer.param_groups:
-    print0(f"  {group['kind']}: {group['lr']:.6f}")
+for opt in optimizers:
+    for group in opt.param_groups:
+        print0(f"  lr={group['lr']:.6f}")
 
 if torch.cuda.is_available():
     mem = torch.cuda.memory_allocated() / 1e9
@@ -191,7 +256,9 @@ if torch.cuda.is_available():
 # Training loop
 
 def get_lr_multiplier(it):
-    return 1.0 - it / num_iterations
+    # Match stock: flat for first 80%, then linear decay to 0
+    progress = it / num_iterations
+    return 1.0 if progress < 0.8 else 1.0 - (progress - 0.8) / 0.2
 
 # Set checkpoint_dir if not already set
 if not args.resume:
@@ -274,11 +341,13 @@ for step in range(start_step, num_iterations):
 
     # LR schedule (linear decay, matching stock)
     lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
 
     # Optimizer step
-    optimizer.step()
+    for opt in optimizers:
+        opt.step()
     model.zero_grad(set_to_none=True)
 
     # Logging
